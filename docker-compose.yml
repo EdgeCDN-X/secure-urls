@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  secure-urls:
+    build: .
+    container_name: secure-urls
+    ports:
+      - "8080:8080"
+    volumes:
+      - ~/.kube/config:/.kube/config
+
+  httpbin:
+    container_name: httpbin
+    image: kennethreitz/httpbin
+    ports:
+      - "8081:80"
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/html:/usr/share/nginx/html:ro
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - secure-urls 
