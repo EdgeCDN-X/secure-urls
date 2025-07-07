@@ -27,18 +27,16 @@ jobs:
 
       - name: Build Docker image using Makefile
         run: |
+          export DOCKER_REPO="fr6nco"
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            export DOCKER_REPO="fr6nco/secure-urls:${GITHUB_REF_NAME}"
-          else
-            export DOCKER_REPO="fr6nco/secure-urls:latest"
+            export TAG="${GITHUB_REF_NAME}"
           fi
           make docker-build
 
       - name: Push Docker image using Makefile
         run: |
+          export DOCKER_REPO="fr6nco"
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            export DOCKER_REPO="fr6nco/secure-urls:${GITHUB_REF_NAME}"
-          else
-            export DOCKER_REPO="fr6nco/secure-urls:latest"
+            export TAG="${GITHUB_REF_NAME}"
           fi
           make docker-push
