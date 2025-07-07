@@ -2,17 +2,17 @@ package main
 
 import (
 	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
 	ttlcache "secure-urls/cache"
+	"secure-urls/cookie"
+	"secure-urls/utils"
 	"strconv"
 	"time"
 
@@ -25,144 +25,209 @@ import (
 	"go.uber.org/zap"
 	// Import EdgeCDN-X CRDs
 
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/dynamic/dynamicinformer"
 )
 
-var logger *zap.Logger
+const COOKIE_NAME = "ex-sec-session"
 
-type SecureUrlConfig struct {
-	Namespace string `json:"namespace"`
-	Cache     *ttlcache.Cache[infrastructurev1alpha1.SecureKeySpec]
-}
-
-type CookieBody struct {
-	KeyName string `json:"keyName"`
-	Expires int64  `json:"expires"`
-	Service string `json:"service"`
-}
-
-var c = SecureUrlConfig{
+var secureURL = utils.SecureURL{
 	Namespace: "",
 	Cache:     ttlcache.NewCache[infrastructurev1alpha1.SecureKeySpec](10*time.Minute, 30*time.Minute),
+	LogLevel:  "",
 }
 
-func validateSignature(r *http.Request) (bool, string) {
-
+func validateSignature(r *http.Request) (bool, cookie.CookieBody, string) {
 	incomingURL, err := url.Parse(r.Header.Get("X-Original-Url"))
 
 	if err != nil {
-		logger.Debug("Invalid URL in X-Original-Url", zap.Error(err))
-		return false, ""
+		secureURL.Logger.Error("Invalid URL in X-Original-Url", zap.Error(err))
+		return false, cookie.CookieBody{}, ""
 	}
 
 	q := incomingURL.Query()
 
-	expiryStr := q.Get("EX-Expires")
-	keyName := q.Get("EX-KeyName")
-	sig := q.Get("EX-Sign")
+	expiryStr := q.Get(utils.EX_EXPIRES)
+	keyName := q.Get(utils.EX_KEYNAME)
+	sig := q.Get(utils.EX_SIGN)
 
-	logger.Debug("Received expiry, keyname and signature", zap.String("EX-Sign", sig), zap.String("EX-Expires", expiryStr), zap.String("EX-KeyName", keyName))
-	if sig == "" || expiryStr == "" {
-		logger.Debug("Missing signature or expiry in query params")
-		return false, ""
-	}
+	if sig == "" || expiryStr == "" || keyName == "" {
+		c, err := r.Cookie(COOKIE_NAME)
+		if err == nil && c != nil {
+			secureURL.Logger.Debug("Secure Cookie found in request", zap.String(COOKIE_NAME, c.Value))
 
-	expiry, err := strconv.ParseInt(expiryStr, 10, 64)
-	if err != nil {
-		logger.Debug("Invalid expiry", zap.Error(err))
-		return false, ""
-	}
-	if time.Now().Unix() > expiry {
-		logger.Debug("Signature expired", zap.Int64("now", time.Now().Unix()), zap.Int64("expiry", expiry))
-		return false, "" // expired
-	}
+			cookiePayload, signature, err := utils.DecodeCookie(c.Value)
 
-	// Remove signature from the query params
-	q.Del("EX-Sign")
-	incomingURL.RawQuery = q.Encode()
+			if err != nil {
+				secureURL.Logger.Debug("Failed to decode cookie", zap.Error(err))
+				return false, cookie.CookieBody{}, ""
+			}
 
-	logger.Debug("URL to be signed", zap.String("url", incomingURL.String()))
+			secureURL.Logger.Debug("Decoded cookie", zap.Any("cookiePayload", cookiePayload), zap.String("signature", hex.EncodeToString(signature)))
 
-	keyid := fmt.Sprintf("%s.%s", incomingURL.Host, keyName)
+			if time.Now().Unix() > cookiePayload.Expires {
+				secureURL.Logger.Debug("Cookie expired", zap.Int64("now", time.Now().Unix()), zap.Int64("expiry", cookiePayload.Expires))
+				return false, cookie.CookieBody{}, ""
+			}
 
-	key, ok := c.Cache.Get(keyid)
+			keyid := fmt.Sprintf("%s.%s", cookiePayload.Service, cookiePayload.KeyName)
+			key, ok := secureURL.Cache.Get(keyid)
 
-	if !ok {
-		logger.Debug("Key not found in cache", zap.String("key", keyid))
-		return false, ""
-	}
+			if !ok {
+				secureURL.Logger.Debug("Key not found in cache", zap.String("key", keyid))
+				return false, cookie.CookieBody{}, ""
+			}
 
-	// Compute expected signature
-	mac := hmac.New(sha256.New, []byte(key.Value))
-	mac.Write([]byte(incomingURL.String()))
-	expectedSig := hex.EncodeToString(mac.Sum(nil))
-	logger.Debug("Expected signature", zap.String("expected", expectedSig))
+			incomingURL.Path = utils.StripLastElementFromPath(incomingURL.Path)
 
-	verified := hmac.Equal([]byte(sig), []byte(expectedSig))
-	logger.Debug("Signature valid", zap.Bool("valid", verified))
+			if cookiePayload.URL != incomingURL.Path {
+				// TODO support for exact URLs and Parent Path Prefixes
+				secureURL.Logger.Debug("Cookie URL does not match incoming URL", zap.String("cookieURL", cookiePayload.URL), zap.String("incomingURL", incomingURL.Path))
+				return false, cookie.CookieBody{}, ""
+			}
 
-	if verified {
-		cookiePayload := CookieBody{
-			KeyName: keyid,
-			Service: incomingURL.Host,
-			Expires: time.Now().Unix() + 1*60*60, // 1 hour
+			payload, err := json.Marshal(cookiePayload)
+			if err != nil {
+				secureURL.Logger.Error("Failed to marshal cookie payload", zap.Error(err))
+				return false, cookie.CookieBody{}, ""
+			}
+
+			verifySig := utils.SignPayload(payload, key.Value)
+			secureURL.Logger.Debug("Cookie signature", zap.String("signature", hex.EncodeToString(verifySig)))
+			verified := hmac.Equal(signature, verifySig)
+
+			if verified {
+				if time.Until(time.Unix(cookiePayload.Expires, 0)) < 20*time.Minute {
+					// Refresh cookie if expires soon
+					secureURL.Logger.Debug("Cookie expires in less than 20 minutes. Refreshing session cookie", zap.Int64("expires_in_sec", cookiePayload.Expires-time.Now().Unix()))
+					cookiePayload.Expires = time.Now().Unix() + 1*60*60 // Extend expiry by 1 hour
+					payload, err = json.Marshal(cookiePayload)
+					if err != nil {
+						secureURL.Logger.Error("Failed to marshal cookie payload for refresh", zap.Error(err))
+						return false, cookie.CookieBody{}, ""
+					}
+					cookieSig := utils.SignPayload(payload, key.Value)
+					secureURL.Logger.Debug("Created new cookie signature", zap.String("signature", hex.EncodeToString(cookieSig)))
+					cookie := base64.URLEncoding.EncodeToString(payload) + "." + base64.URLEncoding.EncodeToString(cookieSig)
+					secureURL.Logger.Debug("Returning refreshed cookie", zap.String("cookie", cookie))
+
+					return true, cookiePayload, cookie
+				}
+
+				return true, cookiePayload, ""
+			}
+
+			return false, cookie.CookieBody{}, ""
 		}
 
-		payload, err := json.Marshal(cookiePayload)
+		secureURL.Logger.Debug("Missing correct query or cookie in request.")
+		return false, cookie.CookieBody{}, ""
+	} else {
+		secureURL.Logger.Debug("Received query params in URL", zap.String("EX-Sign", sig), zap.String("EX-Expires", expiryStr), zap.String("EX-KeyName", keyName))
+
+		expiry, err := strconv.ParseInt(expiryStr, 10, 64)
 		if err != nil {
-			logger.Error("Failed to marshal cookie payload", zap.Error(err))
-			return false, ""
+			secureURL.Logger.Debug("Invalid expiry", zap.Error(err))
+			return false, cookie.CookieBody{}, ""
+		}
+		if time.Now().Unix() > expiry {
+			secureURL.Logger.Debug("Signature expired", zap.Int64("now", time.Now().Unix()), zap.Int64("expiry", expiry))
+			return false, cookie.CookieBody{}, "" // expired
 		}
 
-		cookiemac := hmac.New(sha256.New, []byte(key.Value))
-		cookiemac.Write(payload)
+		incomingURL.Path = utils.StripLastElementFromPath(incomingURL.Path)
 
-		cookiesignature := mac.Sum(nil)
-		cookie := base64.URLEncoding.EncodeToString(payload) + "." + base64.URLEncoding.EncodeToString(cookiesignature)
+		// Remove signature from the query params to avoid signing it again
+		q.Del("EX-Sign")
+		incomingURL.RawQuery = q.Encode()
 
-		return verified, cookie
+		secureURL.Logger.Debug("URL to be signed", zap.String("url", incomingURL.String()))
+		keyid := fmt.Sprintf("%s.%s", incomingURL.Host, keyName)
+
+		key, ok := secureURL.Cache.Get(keyid)
+
+		if !ok {
+			secureURL.Logger.Debug("Key not found in cache", zap.String("key", keyid))
+			return false, cookie.CookieBody{}, ""
+		}
+
+		// Compute expected signature
+		calculatedSig := utils.SignPayload([]byte(incomingURL.String()), key.Value)
+		secureURL.Logger.Debug("Calculated URL Signature", zap.String("expected", hex.EncodeToString(calculatedSig)))
+
+		urlSign, err := hex.DecodeString(sig)
+		if err != nil {
+			secureURL.Logger.Debug("Invalid signature format", zap.Error(err))
+			return false, cookie.CookieBody{}, ""
+		}
+
+		verified := hmac.Equal(urlSign, calculatedSig)
+		secureURL.Logger.Debug("URL Signature valid", zap.Bool("valid", verified))
+
+		if verified {
+			cookiePayload := cookie.CookieBody{
+				KeyName: keyName,
+				Service: incomingURL.Host,
+				Expires: time.Now().Unix() + 1*60*60,
+				URL:     incomingURL.Path,
+			}
+
+			payload, err := json.Marshal(cookiePayload)
+			if err != nil {
+				secureURL.Logger.Error("Failed to marshal cookie payload", zap.Error(err))
+				return false, cookie.CookieBody{}, ""
+			}
+
+			cookieSig := utils.SignPayload(payload, key.Value)
+			secureURL.Logger.Debug("Created cookie signature", zap.String("signature", hex.EncodeToString(cookieSig)))
+
+			cookie := base64.URLEncoding.EncodeToString(payload) + "." + base64.URLEncoding.EncodeToString(cookieSig)
+			return verified, cookiePayload, cookie
+		}
+
+		return verified, cookie.CookieBody{}, ""
 	}
-
-	return verified, ""
 }
 
-func handler(w http.ResponseWriter, r *http.Request) {
+func requestHandler(w http.ResponseWriter, r *http.Request) {
 
-	logger.Info("--- Incoming Request ---",
+	secureURL.Logger.Debug("--- Incoming Request ---",
 		zap.String("url", r.URL.String()),
 		zap.String("path", r.URL.Path),
 		zap.Any("query_params", r.URL.Query()),
 	)
-	logger.Info("Headers", zap.Any("headers", r.Header))
-	logger.Info("------------------------")
+	secureURL.Logger.Debug("Headers", zap.Any("headers", r.Header))
+	secureURL.Logger.Debug("------------------------")
 
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		logger.Info("Method not allowed", zap.String("method", r.Method))
+		secureURL.Logger.Info("Method not allowed", zap.String("method", r.Method))
 		return
 	}
 
-	valid, cookie := validateSignature(r)
+	valid, cookiePayload, cookie := validateSignature(r)
 
 	if !valid {
 		w.WriteHeader(http.StatusUnauthorized)
-		logger.Info("Unauthorized: invalid or expired signature")
+		secureURL.Logger.Info("Unauthorized: invalid or expired signature")
 		return
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     "EX-Cookie",
-		Value:    cookie,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-	})
+	secureURL.Logger.Info("valid signature", zap.Any("cookiePayload", cookiePayload), zap.String("cookie", cookie))
+
+	if cookie != "" {
+		http.SetCookie(w, &http.Cookie{
+			Name:     COOKIE_NAME,
+			Value:    cookie,
+			Path:     cookiePayload.URL,
+			HttpOnly: true,
+			Secure:   false,
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
 
 	w.Write([]byte("Request details logged to stdout.\n"))
 }
@@ -184,7 +249,7 @@ func setupK8sClient() (*dynamic.DynamicClient, error) {
 	// Try in-cluster config
 	config, err = rest.InClusterConfig()
 	if err != nil {
-		logger.Info("Falling back to kubeconfig", zap.Error(err))
+		secureURL.Logger.Info("Falling back to kubeconfig", zap.Error(err))
 		kubeconfig := os.Getenv("KUBECONFIG")
 		if kubeconfig == "" {
 			home, _ := os.UserHomeDir()
@@ -192,29 +257,30 @@ func setupK8sClient() (*dynamic.DynamicClient, error) {
 		}
 		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
 		if err != nil {
-			logger.Error("Failed to load kubeconfig", zap.Error(err))
+			secureURL.Logger.Error("Failed to load kubeconfig", zap.Error(err))
 			return nil, err
 		}
 	}
 
 	clientset, err := dynamic.NewForConfig(config)
 	if err != nil {
-		logger.Error("Failed to create k8s client", zap.Error(err))
+		secureURL.Logger.Error("Failed to create k8s client", zap.Error(err))
 		return nil, err
 	}
-	logger.Info("Kubernetes client initialized")
+	secureURL.Logger.Info("Kubernetes client initialized")
 	return clientset, nil
 }
 
 func main() {
-	flag.StringVar(&c.Namespace, "namespace", "", "Namespace for the application")
+	flag.StringVar(&secureURL.Namespace, "namespace", "", "Namespace for the application")
+	flag.StringVar(&secureURL.LogLevel, "log-level", "info", "Log level: debug, info, warn, error")
 	flag.Parse()
 
 	var err error
-	logger, err = zap.NewDevelopment()
-	if err != nil {
-		log.Fatalf("Failed to initialize zap logger: %v", err)
-	}
+
+	level := utils.ParseLogLevel(secureURL.LogLevel)
+	logger := utils.NewLogger(level)
+	secureURL.Logger = logger
 	defer logger.Sync()
 
 	clientset, err := setupK8sClient()
@@ -223,7 +289,7 @@ func main() {
 	}
 	_ = clientset // Use or remove as needed
 
-	fac := dynamicinformer.NewFilteredDynamicSharedInformerFactory(clientset, 5*time.Minute, c.Namespace, nil)
+	fac := dynamicinformer.NewFilteredDynamicSharedInformerFactory(clientset, 5*time.Minute, secureURL.Namespace, nil)
 
 	informer := fac.ForResource(schema.GroupVersionResource{
 		Group:    infrastructurev1alpha1.GroupVersion.Group,
@@ -239,7 +305,7 @@ func main() {
 			json.Unmarshal(temp, service)
 			for _, key := range service.Spec.SecureKeys {
 				logger.Info("Adding key to cache", zap.String("key", fmt.Sprintf("%s.%s", service.Spec.Domain, key.Name)))
-				c.Cache.Set(fmt.Sprintf("%s.%s", service.Spec.Domain, key.Name), key)
+				secureURL.Cache.Set(fmt.Sprintf("%s.%s", service.Spec.Domain, key.Name), key)
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
@@ -253,11 +319,11 @@ func main() {
 			json.Unmarshal(temp, newService)
 			for _, key := range oldService.Spec.SecureKeys {
 				logger.Info("Deleting key from cache", zap.String("key", fmt.Sprintf("%s.%s", oldService.Spec.Domain, key.Name)))
-				c.Cache.Delete(fmt.Sprintf("%s.%s", oldService.Spec.Domain, key.Name))
+				secureURL.Cache.Delete(fmt.Sprintf("%s.%s", oldService.Spec.Domain, key.Name))
 			}
 			for _, key := range newService.Spec.SecureKeys {
 				logger.Info("Adding key to cache", zap.String("key", fmt.Sprintf("%s.%s", newService.Spec.Domain, key.Name)))
-				c.Cache.Set(fmt.Sprintf("%s.%s", newService.Spec.Domain, key.Name), key)
+				secureURL.Cache.Set(fmt.Sprintf("%s.%s", newService.Spec.Domain, key.Name), key)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -267,7 +333,7 @@ func main() {
 			json.Unmarshal(temp, service)
 			for _, key := range service.Spec.SecureKeys {
 				logger.Info("Deleting key from cache", zap.String("key", fmt.Sprintf("%s.%s", service.Spec.Domain, key.Name)))
-				c.Cache.Delete(fmt.Sprintf("%s.%s", service.Spec.Domain, key.Name))
+				secureURL.Cache.Delete(fmt.Sprintf("%s.%s", service.Spec.Domain, key.Name))
 			}
 		},
 	})
@@ -275,7 +341,7 @@ func main() {
 	factoryCloseChan := make(chan struct{})
 	fac.Start(factoryCloseChan)
 
-	http.HandleFunc("/", handler)
+	http.HandleFunc("/", requestHandler)
 	http.HandleFunc("/healthz", healthzHandler)
 	logger.Info("Server listening", zap.String("address", "http://localhost:8080"))
 	if err := http.ListenAndServe(":8080", nil); err != nil {
