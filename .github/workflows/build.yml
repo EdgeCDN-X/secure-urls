@@ -16,6 +16,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -25,18 +28,17 @@ jobs:
           username: ${{ secrets.DOCKER_LOGIN }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Build Docker image using Makefile
-        run: |
-          export DOCKER_REPO="fr6nco"
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            export TAG="${GITHUB_REF_NAME}"
-          fi
-          make docker-build
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: fr6nco/secure-urls:${{ github.ref_name }}
 
-      - name: Push Docker image using Makefile
-        run: |
-          export DOCKER_REPO="fr6nco"
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            export TAG="${GITHUB_REF_NAME}"
-          fi
-          make docker-push
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: fr6nco/secure-urls:latest
+        if: ${{ github.ref_type == 'refs/heads/main' }}
