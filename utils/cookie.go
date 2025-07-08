@@ -15,7 +15,7 @@ import (
 func DecodeCookie(cookie string) (ck.CookieBody, []byte, error) {
 	parts := strings.Split(cookie, ".")
 	if len(parts) != 2 {
-		logger.Debug("Invalid cookie format", zap.String(COOKIE_NAME, cookie))
+		logger.Debug("Invalid cookie format", zap.String(EX_COOKIE_NAME, cookie))
 		return ck.CookieBody{}, []byte{}, errors.New("Invalid cookie format")
 	}
 
@@ -39,6 +39,14 @@ func DecodeCookie(cookie string) (ck.CookieBody, []byte, error) {
 		logger.Debug("Invalid cookie payload", zap.Error(err))
 		return ck.CookieBody{}, []byte{}, errors.New("Json unmarshal error")
 	}
+
+	// urlPrefix, err := base64.URLEncoding.DecodeString(cookiePayload.URLPrefix)
+	// if err != nil {
+	// 	logger.Debug("Invalid URLPrefix in cookie payload", zap.Error(err))
+	// 	return ck.CookieBody{}, []byte{}, errors.New("Invalid URLPrefix in cookie payload")
+	// }
+
+	// cookiePayload.URLPrefix = string(urlPrefix)
 
 	return cookiePayload, signature, nil
 }

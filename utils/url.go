@@ -23,3 +23,7 @@ func StripLastElementFromPath(path string) string {
 		return "/"
 	}
 }
+
+func IsValidPrefix(incomingUrl string, prefix string) bool {
+	return len(incomingUrl) >= len(prefix) && incomingUrl[:len(prefix)] == prefix
+}

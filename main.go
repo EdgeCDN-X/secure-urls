@@ -32,8 +32,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-const COOKIE_NAME = "ex-sec-session"
-
 var secureURL = utils.SecureURL{
 	Namespace: "",
 	Cache:     ttlcache.NewCache[infrastructurev1alpha1.SecureKeySpec](10*time.Minute, 30*time.Minute),
@@ -53,11 +51,13 @@ func validateSignature(r *http.Request) (bool, cookie.CookieBody, string) {
 	expiryStr := q.Get(utils.EX_EXPIRES)
 	keyName := q.Get(utils.EX_KEYNAME)
 	sig := q.Get(utils.EX_SIGN)
+	urlPrefix := q.Get(utils.EX_URLPREFIX)
 
-	if sig == "" || expiryStr == "" || keyName == "" {
-		c, err := r.Cookie(COOKIE_NAME)
+	if expiryStr == "" || keyName == "" || sig == "" {
+		// If any of the required query parameters are missing, check for a secure cookie
+		c, err := r.Cookie(utils.EX_COOKIE_NAME)
 		if err == nil && c != nil {
-			secureURL.Logger.Debug("Secure Cookie found in request", zap.String(COOKIE_NAME, c.Value))
+			secureURL.Logger.Debug("Secure Cookie found in request", zap.String(utils.EX_COOKIE_NAME, c.Value))
 
 			cookiePayload, signature, err := utils.DecodeCookie(c.Value)
 
@@ -81,11 +81,14 @@ func validateSignature(r *http.Request) (bool, cookie.CookieBody, string) {
 				return false, cookie.CookieBody{}, ""
 			}
 
-			incomingURL.Path = utils.StripLastElementFromPath(incomingURL.Path)
+			urlPrefixDecoded, err := base64.URLEncoding.DecodeString(cookiePayload.URLPrefix)
+			if err != nil {
+				secureURL.Logger.Debug("Failed to decode URLPrefix from cookie payload", zap.Error(err))
+				return false, cookie.CookieBody{}, ""
+			}
 
-			if cookiePayload.URL != incomingURL.Path {
-				// TODO support for exact URLs and Parent Path Prefixes
-				secureURL.Logger.Debug("Cookie URL does not match incoming URL", zap.String("cookieURL", cookiePayload.URL), zap.String("incomingURL", incomingURL.Path))
+			if !utils.IsValidPrefix(fmt.Sprintf("%s://%s%s", incomingURL.Scheme, incomingURL.Host, incomingURL.Path), string(urlPrefixDecoded)) {
+				secureURL.Logger.Debug("URLPrefix does not match incoming URL path", zap.String("urlPrefix", string(urlPrefixDecoded)), zap.String("incomingPath", fmt.Sprintf("%s://%s/%s", incomingURL.Scheme, incomingURL.Host, incomingURL.Path)))
 				return false, cookie.CookieBody{}, ""
 			}
 
@@ -126,29 +129,48 @@ func validateSignature(r *http.Request) (bool, cookie.CookieBody, string) {
 		secureURL.Logger.Debug("Missing correct query or cookie in request.")
 		return false, cookie.CookieBody{}, ""
 	} else {
-		secureURL.Logger.Debug("Received query params in URL", zap.String("EX-Sign", sig), zap.String("EX-Expires", expiryStr), zap.String("EX-KeyName", keyName))
+		secureURL.Logger.Debug("Received query params in URL", zap.String(utils.EX_URLPREFIX, urlPrefix), zap.String(utils.EX_SIGN, sig), zap.String(utils.EX_EXPIRES, expiryStr), zap.String(utils.EX_KEYNAME, keyName))
 
 		expiry, err := strconv.ParseInt(expiryStr, 10, 64)
 		if err != nil {
-			secureURL.Logger.Debug("Invalid expiry", zap.Error(err))
+			secureURL.Logger.Debug("Failed to parse Expiry value", zap.Error(err))
 			return false, cookie.CookieBody{}, ""
 		}
 		if time.Now().Unix() > expiry {
-			secureURL.Logger.Debug("Signature expired", zap.Int64("now", time.Now().Unix()), zap.Int64("expiry", expiry))
+			secureURL.Logger.Debug("Signature expired", zap.Int64("now", time.Now().Unix()), zap.Int64(utils.EX_EXPIRES, expiry))
 			return false, cookie.CookieBody{}, "" // expired
 		}
 
-		incomingURL.Path = utils.StripLastElementFromPath(incomingURL.Path)
+		if urlPrefix != "" {
+			// Validating signature for a prefix URL
+			// With prefix paths we do not support Query Params
 
-		// Remove signature from the query params to avoid signing it again
-		q.Del("EX-Sign")
-		incomingURL.RawQuery = q.Encode()
+			urlPrefixDecoded, err := base64.URLEncoding.DecodeString(urlPrefix)
+			if err != nil {
+				secureURL.Logger.Debug("Failed to decode URLPrefix", zap.Error(err))
+				return false, cookie.CookieBody{}, ""
+			}
+
+			// Make sure that the urlPrefix matches the current URL path. Include scheme
+			if !utils.IsValidPrefix(fmt.Sprintf("%s://%s%s", incomingURL.Scheme, incomingURL.Host, incomingURL.Path), string(urlPrefixDecoded)) {
+
+				secureURL.Logger.Debug("URLPrefix does not match incoming URL path", zap.String("urlPrefix", string(urlPrefixDecoded)), zap.String("incomingPath", fmt.Sprintf("%s://%s/%s", incomingURL.Scheme, incomingURL.Host, incomingURL.Path)))
+
+				return false, cookie.CookieBody{}, ""
+			}
+
+			// Remove all Query Params from the URL
+			// Ordering of the query params must be preserved
+			incomingURL.RawQuery = fmt.Sprintf("%s=%s&%s=%s&%s=%s", utils.EX_URLPREFIX, urlPrefix, utils.EX_EXPIRES, expiryStr, utils.EX_KEYNAME, keyName)
+		} else {
+			// Validating signature for a single file
+			incomingURL.RawQuery = fmt.Sprintf("%s=%s&%s=%s", utils.EX_EXPIRES, expiryStr, utils.EX_KEYNAME, keyName)
+		}
 
 		secureURL.Logger.Debug("URL to be signed", zap.String("url", incomingURL.String()))
 		keyid := fmt.Sprintf("%s.%s", incomingURL.Host, keyName)
 
 		key, ok := secureURL.Cache.Get(keyid)
-
 		if !ok {
 			secureURL.Logger.Debug("Key not found in cache", zap.String("key", keyid))
 			return false, cookie.CookieBody{}, ""
@@ -167,12 +189,14 @@ func validateSignature(r *http.Request) (bool, cookie.CookieBody, string) {
 		verified := hmac.Equal(urlSign, calculatedSig)
 		secureURL.Logger.Debug("URL Signature valid", zap.Bool("valid", verified))
 
-		if verified {
+		if verified && urlPrefix != "" {
+			// If the signature is valid and we have a URL prefix, create a cookie payload
+			// Please note, urlPrefix here is base64 encoded, no need to decode it
 			cookiePayload := cookie.CookieBody{
-				KeyName: keyName,
-				Service: incomingURL.Host,
-				Expires: time.Now().Unix() + 1*60*60,
-				URL:     incomingURL.Path,
+				KeyName:   keyName,
+				Service:   incomingURL.Host,
+				Expires:   time.Now().Unix() + 1*60*60,
+				URLPrefix: urlPrefix,
 			}
 
 			payload, err := json.Marshal(cookiePayload)
@@ -219,10 +243,11 @@ func requestHandler(w http.ResponseWriter, r *http.Request) {
 	secureURL.Logger.Info("valid signature", zap.Any("cookiePayload", cookiePayload), zap.String("cookie", cookie))
 
 	if cookie != "" {
+		// Cookie path todo
 		http.SetCookie(w, &http.Cookie{
-			Name:     COOKIE_NAME,
+			Name:     utils.EX_COOKIE_NAME,
 			Value:    cookie,
-			Path:     cookiePayload.URL,
+			Path:     "/",
 			HttpOnly: true,
 			Secure:   false,
 			SameSite: http.SameSiteLaxMode,

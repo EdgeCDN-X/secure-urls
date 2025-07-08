@@ -10,7 +10,9 @@ import (
 const EX_EXPIRES = "EX-Expires"
 const EX_KEYNAME = "EX-KeyName"
 const EX_SIGN = "EX-Sign"
+const EX_URLPREFIX = "EX-UrlPrefix"
 const EX_COOKIE_NAME = "ex-sec-session"
+
 const COOKIE_NAME = "ex-sec-session"
 
 type SecureURL struct {
