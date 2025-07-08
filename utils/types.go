@@ -20,4 +20,5 @@ type SecureURL struct {
 	Cache     *ttlcache.Cache[infrastructurev1alpha1.SecureKeySpec]
 	LogLevel  string
 	Logger    *zap.Logger
+	Synced    func() bool
 }

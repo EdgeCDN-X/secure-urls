@@ -40,14 +40,6 @@ func DecodeCookie(cookie string) (ck.CookieBody, []byte, error) {
 		return ck.CookieBody{}, []byte{}, errors.New("Json unmarshal error")
 	}
 
-	// urlPrefix, err := base64.URLEncoding.DecodeString(cookiePayload.URLPrefix)
-	// if err != nil {
-	// 	logger.Debug("Invalid URLPrefix in cookie payload", zap.Error(err))
-	// 	return ck.CookieBody{}, []byte{}, errors.New("Invalid URLPrefix in cookie payload")
-	// }
-
-	// cookiePayload.URLPrefix = string(urlPrefix)
-
 	return cookiePayload, signature, nil
 }
 

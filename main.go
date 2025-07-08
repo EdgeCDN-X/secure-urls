@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	ttlcache "secure-urls/cache"
 	"secure-urls/cookie"
 	"secure-urls/utils"
 	"strconv"
+	"syscall"
 	"time"
 
 	infrastructurev1alpha1 "github.com/EdgeCDN-X/edgecdnx-controller/api/v1alpha1"
@@ -243,13 +245,16 @@ func requestHandler(w http.ResponseWriter, r *http.Request) {
 	secureURL.Logger.Info("valid signature", zap.Any("cookiePayload", cookiePayload), zap.String("cookie", cookie))
 
 	if cookie != "" {
+		decoded, _ := base64.URLEncoding.DecodeString(cookiePayload.URLPrefix)
+		p, _ := url.Parse(string(decoded))
+
 		// Cookie path todo
 		http.SetCookie(w, &http.Cookie{
 			Name:     utils.EX_COOKIE_NAME,
 			Value:    cookie,
-			Path:     "/",
+			Path:     p.Path,
 			HttpOnly: true,
-			Secure:   false,
+			Secure:   true,
 			SameSite: http.SameSiteLaxMode,
 		})
 	}
@@ -258,9 +263,15 @@ func requestHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func healthzHandler(w http.ResponseWriter, r *http.Request) {
-	// TODO response once cache is synced
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok\n"))
+	if secureURL.Synced() {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok\n"))
+	} else {
+		secureURL.Logger.Error("Health check failed: not ready")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("not ready\n"))
+	}
+
 }
 
 func setupK8sClient() (*dynamic.DynamicClient, error) {
@@ -363,11 +374,24 @@ func main() {
 		},
 	})
 
+	secureURL.Synced = informer.HasSynced
+
 	factoryCloseChan := make(chan struct{})
 	fac.Start(factoryCloseChan)
 
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-signalChan
+		logger.Info("Received signal, shutting down", zap.String("signal", sig.String()))
+		close(factoryCloseChan)
+		os.Exit(0)
+	}()
+
 	http.HandleFunc("/", requestHandler)
 	http.HandleFunc("/healthz", healthzHandler)
+
 	logger.Info("Server listening", zap.String("address", "http://localhost:8080"))
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		logger.Fatal("Failed to start server", zap.Error(err))
