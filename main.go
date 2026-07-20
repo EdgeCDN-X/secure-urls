@@ -38,6 +38,7 @@ var secureURL = utils.SecureURL{
 	Namespace: "",
 	Cache:     ttlcache.NewCache[infrastructurev1alpha1.SecureKeySpec](10*time.Minute, 30*time.Minute),
 	LogLevel:  "",
+	Sign:      false,
 }
 
 func validateSignature(r *http.Request) (bool, cookie.CookieBody, string) {
@@ -310,6 +311,13 @@ func setupK8sClient() (*dynamic.DynamicClient, error) {
 func main() {
 	flag.StringVar(&secureURL.Namespace, "namespace", "", "Namespace for the application")
 	flag.StringVar(&secureURL.LogLevel, "log-level", "info", "Log level: debug, info, warn, error")
+	flag.BoolVar(&secureURL.Sign, "sign", false, "Enable Signing Mode - Won't start server if true")
+
+	flag.StringVar(&secureURL.Prefix, "prefix", "", "URL Prefix to sign (required if -sign is true)")
+	flag.StringVar(&secureURL.KeyName, "key-name", "", "Key Name to use for signing (required if -sign is true)")
+	flag.StringVar(&secureURL.KeyValue, "key-value", "", "Key Value to use for signing (required if -sign is true)")
+	flag.StringVar(&secureURL.Url, "url", "", "Full URL to sign (required if -sign is true)")
+
 	flag.Parse()
 
 	var err error
@@ -318,6 +326,14 @@ func main() {
 	logger := utils.NewLogger(level)
 	secureURL.Logger = logger
 	defer logger.Sync()
+
+	if secureURL.Sign {
+
+		if secureURL.KeyName == "" || secureURL.KeyValue == "" || secureURL.Url == "" {
+			logger.Fatal("Signing mode requires -prefix, -key-name, -key-value and -url parameters")
+		}
+
+	}
 
 	clientset, err := setupK8sClient()
 	if err != nil {

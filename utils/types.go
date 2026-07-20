@@ -19,6 +19,12 @@ type SecureURL struct {
 	Namespace string `json:"namespace"`
 	Cache     *ttlcache.Cache[infrastructurev1alpha1.SecureKeySpec]
 	LogLevel  string
+	Sign      bool
 	Logger    *zap.Logger
 	Synced    func() bool
+
+	Prefix   string
+	KeyName  string
+	KeyValue string
+	Url      string
 }
