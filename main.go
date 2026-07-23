@@ -209,7 +209,7 @@ func validateSignature(r *http.Request) (bool, cookie.CookieBody, string) {
 			}
 
 			cookieSig := utils.SignPayload(payload, key.Value)
-			secureURL.Logger.Debug("Created cookie signature", zap.String("signature", hex.EncodeToString(cookieSig)))
+			secureURL.Logger.Debug("Created cookie signature ", zap.String("signature", hex.EncodeToString(cookieSig)))
 
 			cookie := base64.URLEncoding.EncodeToString(payload) + "." + base64.URLEncoding.EncodeToString(cookieSig)
 			return verified, cookiePayload, cookie
