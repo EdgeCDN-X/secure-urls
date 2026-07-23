@@ -257,6 +257,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request) {
 			HttpOnly: true,
 			Secure:   true,
 			SameSite: http.SameSiteLaxMode,
+			Domain:   cookiePayload.Service,
 		})
 	}
 
