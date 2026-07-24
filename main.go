@@ -256,8 +256,10 @@ func requestHandler(w http.ResponseWriter, r *http.Request) {
 			Path:     p.Path,
 			HttpOnly: true,
 			Secure:   true,
-			SameSite: http.SameSiteLaxMode,
+			SameSite: http.SameSiteNoneMode,
 			Domain:   cookiePayload.Service,
+			Expires:  time.Unix(cookiePayload.Expires, 0),
+			MaxAge:   int(time.Until(time.Unix(cookiePayload.Expires, 0)).Seconds()),
 		})
 	}
 
